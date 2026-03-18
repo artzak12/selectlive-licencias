@@ -1,14 +1,17 @@
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 import asyncpg
 from dotenv import load_dotenv
 
+load_dotenv()
+
 # Leer la URL de la base de datos de Supabase desde variable de entorno
 DATABASE_URL = os.getenv("DATABASE_URL") or "postgresql://postgres:Tiablanca-1221@db.xgwiuldzahyudhouoene.supabase.co:5432/postgres"
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # token simple para panel interno
 
 app = FastAPI(title="SelectLive License Server")
 
@@ -126,3 +129,66 @@ async def check(req: CheckRequest):
         await conn.close()
 
     return {"ok": True}
+
+
+class CreateLicenseRequest(BaseModel):
+    """
+    Modelo para crear licencias desde tu panel interno.
+    - days_valid: número de días de validez (None = sin caducidad)
+    """
+
+    max_devices: int = 1
+    days_valid: int | None = 365
+
+
+class CreateLicenseResponse(BaseModel):
+    license_key: str
+    expires_at: datetime | None
+    max_devices: int
+
+
+@app.post("/admin/create_license", response_model=CreateLicenseResponse)
+async def create_license(
+    body: CreateLicenseRequest,
+    x_admin_token: str = Header(None, alias="X-Admin-Token"),
+):
+    """
+    Endpoint interno para crear licencias nuevas.
+    Protegido con un token simple en cabecera X-Admin-Token.
+    """
+    if not ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="ADMIN_TOKEN no está configurado en el servidor",
+        )
+
+    if not x_admin_token or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="No autorizado")
+
+    expires_at: datetime | None = None
+    if body.days_valid is not None:
+        expires_at = datetime.now(timezone.utc) + timedelta(days=body.days_valid)
+
+    license_id = uuid.uuid4()
+    license_key = uuid.uuid4().hex[:16].upper()
+
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            """
+            INSERT INTO licenses (id, license_key, status, max_devices, expires_at)
+            VALUES ($1, $2, 'active', $3, $4)
+            """,
+            license_id,
+            license_key,
+            body.max_devices,
+            expires_at,
+        )
+    finally:
+        await conn.close()
+
+    return CreateLicenseResponse(
+        license_key=license_key,
+        expires_at=expires_at,
+        max_devices=body.max_devices,
+    )
