@@ -196,8 +196,18 @@ async def check(req: CheckRequest):
         if not lic or lic["status"] != "active":
             raise HTTPException(status_code=403, detail="Licencia no activa")
 
-        if lic["expires_at"] and lic["expires_at"] < datetime.now(timezone.utc):
+        expires_at = lic["expires_at"]
+        now = datetime.now(timezone.utc)
+
+        # Comprobar caducidad
+        if expires_at and expires_at < now:
             raise HTTPException(status_code=403, detail="Licencia caducada")
+
+        # Calcular días restantes (si hay fecha de caducidad)
+        days_left: int | None = None
+        if expires_at is not None:
+            diff = expires_at - now
+            days_left = max(diff.days, 0)
 
         # Actualizar last_seen
         await conn.execute(
@@ -212,7 +222,12 @@ async def check(req: CheckRequest):
     finally:
         await conn.close()
 
-    return {"ok": True}
+    return {
+        "ok": True,
+        "status": "active",
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "days_left": days_left,
+    }
 
 
 class CreateLicenseRequest(BaseModel):
