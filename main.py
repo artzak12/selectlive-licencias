@@ -22,6 +22,48 @@ async def get_conn():
     return await asyncpg.connect(DATABASE_URL)
 
 
+async def _cleanup_expired() -> None:
+    """
+    Limpia licencias caducadas:
+    - elimina activaciones asociadas
+    - elimina el registro en issued_licenses
+    - elimina la licencia en licenses
+
+    Esto mantiene la BD "limpia" y hace que el panel de clientes no muestre caducadas.
+    """
+    conn = await get_conn()
+    try:
+        async with conn.transaction():
+            expired = await conn.fetch(
+                """
+                SELECT id
+                FROM licenses
+                WHERE expires_at IS NOT NULL
+                  AND expires_at < now()
+                """
+            )
+            if not expired:
+                return
+
+            expired_ids = [r["id"] for r in expired]
+
+            await conn.execute(
+                "DELETE FROM license_activations WHERE license_id = ANY($1::uuid[])",
+                expired_ids,
+            )
+            # issued_licenses usa license_id también
+            await conn.execute(
+                "DELETE FROM issued_licenses WHERE license_id = ANY($1::uuid[])",
+                expired_ids,
+            )
+            await conn.execute(
+                "DELETE FROM licenses WHERE id = ANY($1::uuid[])",
+                expired_ids,
+            )
+    finally:
+        await conn.close()
+
+
 async def _ensure_admin_tables() -> None:
     """
     Crea (si no existen) las tablas auxiliares para el panel interno.
@@ -51,6 +93,7 @@ async def _ensure_admin_tables() -> None:
 @app.on_event("startup")
 async def _startup():
     await _ensure_admin_tables()
+    await _cleanup_expired()
 
 
 class ActivateRequest(BaseModel):
@@ -64,6 +107,8 @@ class ActivateResponse(BaseModel):
 
 @app.post("/activate", response_model=ActivateResponse)
 async def activate(req: ActivateRequest):
+    # Limpieza para que licencias ya caducadas desaparezcan y no se puedan usar
+    await _cleanup_expired()
     conn = await get_conn()
     try:
         lic = await conn.fetchrow(
@@ -125,6 +170,7 @@ class CheckRequest(BaseModel):
 
 @app.post("/check")
 async def check(req: CheckRequest):
+    await _cleanup_expired()
     # Extraer datos del token
     try:
         license_key, machine_id = req.activation_token.split("::", 1)
@@ -290,6 +336,9 @@ async def list_clients(
     if not x_admin_token or x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="No autorizado")
 
+    # Evita mostrar caducadas
+    await _cleanup_expired()
+
     conn = await get_conn()
     try:
         rows = await conn.fetch(
@@ -312,3 +361,46 @@ async def list_clients(
         ]
     finally:
         await conn.close()
+
+
+@app.delete("/admin/license/{license_key}")
+async def delete_license(
+    license_key: str,
+    x_admin_token: str = Header(None, alias="X-Admin-Token"),
+):
+    if not ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="ADMIN_TOKEN no está configurado en el servidor",
+        )
+
+    if not x_admin_token or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="No autorizado")
+
+    conn = await get_conn()
+    try:
+        lic = await conn.fetchrow(
+            "SELECT id FROM licenses WHERE license_key = $1",
+            license_key.strip(),
+        )
+        if not lic:
+            raise HTTPException(status_code=404, detail="Licencia no encontrada")
+
+        license_id = lic["id"]
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM license_activations WHERE license_id = $1",
+                license_id,
+            )
+            await conn.execute(
+                "DELETE FROM issued_licenses WHERE license_id = $1",
+                license_id,
+            )
+            await conn.execute(
+                "DELETE FROM licenses WHERE id = $1",
+                license_id,
+            )
+    finally:
+        await conn.close()
+
+    return {"ok": True}

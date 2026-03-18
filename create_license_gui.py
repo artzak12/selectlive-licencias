@@ -123,6 +123,19 @@ class LicenseCreatorApp:
         top = tk.Frame(self.tab_clients, bg="#101820")
         top.pack(fill="x", pady=(5, 8))
 
+        btn_delete = tk.Button(
+            top,
+            text="🗑 Eliminar licencia",
+            font=("Segoe UI", 10, "bold"),
+            bg="#EC7063",
+            fg="white",
+            activebackground="#E74C3C",
+            activeforeground="white",
+            relief="flat",
+            command=self._delete_selected_license,
+        )
+        btn_delete.pack(side="right", padx=5)
+
         btn_refresh = tk.Button(
             top,
             text="↻ Actualizar",
@@ -154,6 +167,66 @@ class LicenseCreatorApp:
         self.tree.column("licencia", width=150, anchor="w")
 
         self.tree.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+
+    def _get_selected_license_key(self) -> str | None:
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        values = self.tree.item(sel[0], "values")
+        if not values or len(values) < 6:
+            return None
+        return str(values[5])
+
+    def _delete_selected_license(self):
+        if not self.admin_token:
+            messagebox.showerror(
+                "Error de configuración",
+                "ADMIN_TOKEN no está configurado.",
+            )
+            return
+
+        license_key = self._get_selected_license_key()
+        if not license_key:
+            messagebox.showwarning(
+                "Selecciona una fila",
+                "Selecciona un cliente/licencia en la tabla para eliminarla.",
+            )
+            return
+
+        ok = messagebox.askyesno(
+            "Confirmar eliminación",
+            f"¿Seguro que quieres eliminar esta licencia?\n\n{license_key}\n\n"
+            "Esto la borrará del servidor y dejará de funcionar en los clientes.",
+        )
+        if not ok:
+            return
+
+        try:
+            resp = requests.delete(
+                f"{self.base_url}/admin/license/{license_key}",
+                headers={"X-Admin-Token": self.admin_token},
+                timeout=10,
+            )
+        except Exception as e:
+            messagebox.showerror(
+                "Error de conexión",
+                f"No se pudo contactar con el servidor:\n{e}",
+            )
+            return
+
+        if resp.status_code != 200:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                detail = resp.text
+            messagebox.showerror(
+                "Error al eliminar",
+                f"Código {resp.status_code}:\n{detail}",
+            )
+            return
+
+        self._refresh_clients()
+        messagebox.showinfo("Eliminada", "Licencia eliminada correctamente.")
 
     def _build_create_tab(self):
         form = tk.Frame(self.tab_create, bg="#101820")
