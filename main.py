@@ -22,14 +22,13 @@ async def get_conn():
     return await asyncpg.connect(DATABASE_URL)
 
 
-async def _cleanup_expired() -> None:
+async def _archive_expired() -> None:
     """
-    Limpia licencias caducadas:
-    - elimina activaciones asociadas
-    - elimina el registro en issued_licenses
-    - elimina la licencia en licenses
+    Archiva licencias caducadas (sin borrarlas):
+    - pone licenses.status = 'expired'
+    - marca issued_licenses.archived_at
 
-    Esto mantiene la BD "limpia" y hace que el panel de clientes no muestre caducadas.
+    Así se mantienen en histórico y el panel puede mostrarlas como CADUCADO.
     """
     conn = await get_conn()
     try:
@@ -48,16 +47,20 @@ async def _cleanup_expired() -> None:
             expired_ids = [r["id"] for r in expired]
 
             await conn.execute(
-                "DELETE FROM license_activations WHERE license_id = ANY($1::uuid[])",
+                """
+                UPDATE licenses
+                SET status = 'expired'
+                WHERE id = ANY($1::uuid[])
+                """,
                 expired_ids,
             )
-            # issued_licenses usa license_id también
+
             await conn.execute(
-                "DELETE FROM issued_licenses WHERE license_id = ANY($1::uuid[])",
-                expired_ids,
-            )
-            await conn.execute(
-                "DELETE FROM licenses WHERE id = ANY($1::uuid[])",
+                """
+                UPDATE issued_licenses
+                SET archived_at = COALESCE(archived_at, now())
+                WHERE license_id = ANY($1::uuid[])
+                """,
                 expired_ids,
             )
     finally:
@@ -82,9 +85,14 @@ async def _ensure_admin_tables() -> None:
               customer_phone text NOT NULL DEFAULT '',
               duration_label text NOT NULL DEFAULT '',
               expires_at timestamptz NULL,
-              created_at timestamptz NOT NULL DEFAULT now()
+              created_at timestamptz NOT NULL DEFAULT now(),
+              archived_at timestamptz NULL
             );
             """
+        )
+        # Si ya existía la tabla, asegura la columna
+        await conn.execute(
+            "ALTER TABLE issued_licenses ADD COLUMN IF NOT EXISTS archived_at timestamptz NULL"
         )
     finally:
         await conn.close()
@@ -93,7 +101,7 @@ async def _ensure_admin_tables() -> None:
 @app.on_event("startup")
 async def _startup():
     await _ensure_admin_tables()
-    await _cleanup_expired()
+    await _archive_expired()
 
 
 class ActivateRequest(BaseModel):
@@ -107,8 +115,7 @@ class ActivateResponse(BaseModel):
 
 @app.post("/activate", response_model=ActivateResponse)
 async def activate(req: ActivateRequest):
-    # Limpieza para que licencias ya caducadas desaparezcan y no se puedan usar
-    await _cleanup_expired()
+    await _archive_expired()
     conn = await get_conn()
     try:
         lic = await conn.fetchrow(
@@ -170,7 +177,7 @@ class CheckRequest(BaseModel):
 
 @app.post("/check")
 async def check(req: CheckRequest):
-    await _cleanup_expired()
+    await _archive_expired()
     # Extraer datos del token
     try:
         license_key, machine_id = req.activation_token.split("::", 1)
@@ -321,6 +328,8 @@ class ClientRow(BaseModel):
     license_key: str
     expires_at: datetime | None
     created_at: datetime
+    archived_at: datetime | None
+    is_expired: bool
 
 
 @app.get("/admin/clients", response_model=list[ClientRow])
@@ -336,14 +345,14 @@ async def list_clients(
     if not x_admin_token or x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="No autorizado")
 
-    # Evita mostrar caducadas
-    await _cleanup_expired()
+    await _archive_expired()
 
     conn = await get_conn()
     try:
         rows = await conn.fetch(
             """
-            SELECT customer_name, customer_phone, duration_label, license_key, expires_at, created_at
+            SELECT customer_name, customer_phone, duration_label, license_key, expires_at, created_at, archived_at,
+                   (expires_at IS NOT NULL AND expires_at < now()) AS is_expired
             FROM issued_licenses
             ORDER BY created_at DESC
             """
@@ -356,6 +365,8 @@ async def list_clients(
                 license_key=r["license_key"],
                 expires_at=r["expires_at"],
                 created_at=r["created_at"],
+                archived_at=r["archived_at"],
+                is_expired=bool(r["is_expired"]),
             )
             for r in rows
         ]

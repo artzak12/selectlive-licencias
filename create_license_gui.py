@@ -77,6 +77,7 @@ class LicenseCreatorApp:
             font=("Segoe UI", 9, "bold"),
         )
         style.map("Treeview", background=[("selected", "#1E90FF")], foreground=[("selected", "white")])
+        style.configure("Expired.Treeview", foreground="#E74C3C")
 
         # Título
         title = tk.Label(
@@ -167,6 +168,7 @@ class LicenseCreatorApp:
         self.tree.column("licencia", width=150, anchor="w")
 
         self.tree.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+        self.tree.tag_configure("expired", foreground="#E74C3C")
 
     def _get_selected_license_key(self) -> str | None:
         sel = self.tree.selection()
@@ -351,6 +353,7 @@ class LicenseCreatorApp:
             duration = row.get("duration_label") or ""
             license_key = row.get("license_key") or ""
             expires_at = row.get("expires_at")
+            is_expired = bool(row.get("is_expired"))
 
             caducidad = "Permanente"
             if expires_at:
@@ -360,12 +363,13 @@ class LicenseCreatorApp:
                 except Exception:
                     caducidad = str(expires_at)
 
-            restante = self._human_remaining(expires_at)
+            restante = "CADUCADO" if is_expired else self._human_remaining(expires_at)
 
             self.tree.insert(
                 "",
                 "end",
                 values=(name, phone, duration, caducidad, restante, license_key),
+                tags=("expired",) if is_expired else (),
             )
 
     def crear_licencia(self):
