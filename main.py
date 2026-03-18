@@ -321,6 +321,90 @@ async def create_license(
     )
 
 
+class ExtendLicenseRequest(BaseModel):
+    duration_label: str  # "3 días" / "1 mes" / ... / "Permanente"
+
+
+@app.post("/admin/extend_license/{license_key}")
+async def extend_license(
+    license_key: str,
+    body: ExtendLicenseRequest,
+    x_admin_token: str = Header(None, alias="X-Admin-Token"),
+):
+    if not ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="ADMIN_TOKEN no está configurado en el servidor",
+        )
+
+    if not x_admin_token or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="No autorizado")
+
+    await _archive_expired()
+
+    duration_map = {
+        "3 días": 3,
+        "1 mes": 30,
+        "3 meses": 90,
+        "6 meses": 180,
+        "12 meses": 365,
+        "Permanente": None,
+    }
+
+    if body.duration_label not in duration_map:
+        raise HTTPException(status_code=400, detail="Duración no válida")
+
+    add_days = duration_map[body.duration_label]
+
+    conn = await get_conn()
+    try:
+        lic = await conn.fetchrow(
+            "SELECT id, expires_at FROM licenses WHERE license_key = $1",
+            license_key.strip(),
+        )
+        if not lic:
+            raise HTTPException(status_code=404, detail="Licencia no encontrada")
+
+        # Base: si estaba caducada, sumamos desde "ahora"; si no, desde su expires_at
+        now = datetime.now(timezone.utc)
+        current_expires = lic["expires_at"]
+
+        if add_days is None:
+            new_expires = None
+        else:
+            base = current_expires if (current_expires and current_expires > now) else now
+            new_expires = base + timedelta(days=int(add_days))
+
+        async with conn.transaction():
+            await conn.execute(
+                """
+                UPDATE licenses
+                SET expires_at = $2,
+                    status = 'active'
+                WHERE id = $1
+                """,
+                lic["id"],
+                new_expires,
+            )
+
+            await conn.execute(
+                """
+                UPDATE issued_licenses
+                SET expires_at = $2,
+                    duration_label = $3,
+                    archived_at = NULL
+                WHERE license_key = $1
+                """,
+                license_key.strip(),
+                new_expires,
+                body.duration_label,
+            )
+    finally:
+        await conn.close()
+
+    return {"ok": True, "expires_at": new_expires}
+
+
 class ClientRow(BaseModel):
     customer_name: str
     customer_phone: str

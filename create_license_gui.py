@@ -7,6 +7,7 @@ import os
 import tkinter as tk
 from tkinter import ttk
 from tkinter import messagebox
+from tkinter import simpledialog
 from datetime import datetime, timezone
 
 import requests
@@ -33,8 +34,8 @@ class LicenseCreatorApp:
         self.root = root
         self.root.title("SelectLive - Panel de licencias")
         self.root.configure(bg="#101820")
-        self.root.geometry("820x420")
-        self.root.resizable(False, False)
+        self.root.geometry("1100x600")
+        self.root.resizable(True, True)
 
         # Centrar ventana
         self.root.update_idletasks()
@@ -42,9 +43,13 @@ class LicenseCreatorApp:
         h = self.root.winfo_height()
         x = (self.root.winfo_screenwidth() // 2) - (w // 2)
         y = (self.root.winfo_screenheight() // 2) - (h // 2)
-        self.root.geometry(f"820x420+{x}+{y}")
+        self.root.geometry(f"1100x600+{x}+{y}")
 
         self.base_url, self.admin_token = cargar_config()
+
+        # Mantener referencia para que no lo recoja el GC
+        self._logo_img = None
+        self._clients_cache: list[tuple] = []
 
         self._build_ui()
         self._refresh_clients()
@@ -79,15 +84,29 @@ class LicenseCreatorApp:
         style.map("Treeview", background=[("selected", "#1E90FF")], foreground=[("selected", "white")])
         style.configure("Expired.Treeview", foreground="#E74C3C")
 
-        # Título
-        title = tk.Label(
-            self.root,
-            text="Panel interno de licencias",
-            font=("Segoe UI", 16, "bold"),
-            fg="#1E90FF",
-            bg="#101820",
-        )
-        title.pack(pady=(15, 5))
+        # Logo superior (si existe)
+        logo_frame = tk.Frame(self.root, bg="#101820")
+        logo_frame.pack(pady=(15, 5))
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        logo_path = os.path.join(base_dir, "logo_licencias.png")
+
+        if os.path.exists(logo_path):
+            try:
+                self._logo_img = tk.PhotoImage(file=logo_path)
+            except Exception:
+                self._logo_img = None
+
+        if self._logo_img:
+            tk.Label(logo_frame, image=self._logo_img, bg="#101820").pack()
+        else:
+            tk.Label(
+                logo_frame,
+                text="Panel interno de licencias",
+                font=("Segoe UI", 16, "bold"),
+                fg="#1E90FF",
+                bg="#101820",
+            ).pack()
 
         subtitle = tk.Label(
             self.root,
@@ -123,6 +142,64 @@ class LicenseCreatorApp:
     def _build_clients_tab(self):
         top = tk.Frame(self.tab_clients, bg="#101820")
         top.pack(fill="x", pady=(5, 8))
+
+        # Buscador
+        tk.Label(
+            top,
+            text="Buscar:",
+            font=("Segoe UI", 10),
+            fg="#B0B0B0",
+            bg="#101820",
+        ).pack(side="left", padx=(5, 6))
+
+        self.search_var = tk.StringVar(value="")
+        self.entry_search = tk.Entry(
+            top,
+            textvariable=self.search_var,
+            font=("Segoe UI", 10),
+            width=35,
+        )
+        self.entry_search.pack(side="left", padx=(0, 10))
+        self.entry_search.bind("<KeyRelease>", lambda _e: self._apply_filter())
+
+        btn_copy_mail = tk.Button(
+            top,
+            text="✉ Copiar mail",
+            font=("Segoe UI", 10, "bold"),
+            bg="#1E90FF",
+            fg="white",
+            activebackground="#00A8FF",
+            activeforeground="white",
+            relief="flat",
+            command=self._copy_mail_for_selected,
+        )
+        btn_copy_mail.pack(side="right", padx=5)
+
+        btn_extend = tk.Button(
+            top,
+            text="➕ Añadir tiempo",
+            font=("Segoe UI", 10, "bold"),
+            bg="#58D68D",
+            fg="white",
+            activebackground="#2ECC71",
+            activeforeground="white",
+            relief="flat",
+            command=self._extend_selected_license,
+        )
+        btn_extend.pack(side="right", padx=5)
+
+        btn_copy = tk.Button(
+            top,
+            text="⧉ Copiar clave",
+            font=("Segoe UI", 10, "bold"),
+            bg="#1E90FF",
+            fg="white",
+            activebackground="#00A8FF",
+            activeforeground="white",
+            relief="flat",
+            command=self._copy_selected_license,
+        )
+        btn_copy.pack(side="right", padx=5)
 
         btn_delete = tk.Button(
             top,
@@ -169,15 +246,175 @@ class LicenseCreatorApp:
 
         self.tree.pack(fill="both", expand=True, padx=5, pady=(0, 5))
         self.tree.tag_configure("expired", foreground="#E74C3C")
+        self.tree.bind("<Double-1>", lambda _e: self._copy_selected_license())
 
-    def _get_selected_license_key(self) -> str | None:
+    def _apply_filter(self):
+        q = (self.search_var.get() or "").strip().lower()
+
+        # Limpiar tabla
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        if not q:
+            rows = self._clients_cache
+        else:
+            rows = []
+            for values, tags in self._clients_cache:
+                nombre, telefono, _duracion, _caducidad, _restante, clave = values
+                hay = (
+                    (str(nombre).lower().find(q) != -1)
+                    or (str(telefono).lower().find(q) != -1)
+                    or (str(clave).lower().find(q) != -1)
+                )
+                if hay:
+                    rows.append((values, tags))
+
+        for values, tags in rows:
+            self.tree.insert("", "end", values=values, tags=tags)
+
+    def _get_selected_row(self) -> tuple | None:
         sel = self.tree.selection()
         if not sel:
             return None
         values = self.tree.item(sel[0], "values")
         if not values or len(values) < 6:
             return None
+        return values
+
+    def _get_selected_license_key(self) -> str | None:
+        values = self._get_selected_row()
+        if not values:
+            return None
         return str(values[5])
+
+    def _copy_selected_license(self):
+        license_key = self._get_selected_license_key()
+        if not license_key:
+            messagebox.showwarning(
+                "Selecciona una fila",
+                "Selecciona un cliente/licencia en la tabla para copiar la clave.",
+            )
+            return
+
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(license_key)
+            self.root.update()  # asegura que se copie incluso si se cierra rápido
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo copiar al portapapeles:\n{e}")
+            return
+
+        messagebox.showinfo("Copiado", f"Clave copiada:\n\n{license_key}")
+
+    def _copy_mail_for_selected(self):
+        values = self._get_selected_row()
+        if not values:
+            messagebox.showwarning(
+                "Selecciona una fila",
+                "Selecciona un cliente/licencia en la tabla para copiar el mail.",
+            )
+            return
+
+        nombre, _telefono, _duracion, caducidad, _restante, clave = values
+
+        # Si es permanente o no hay fecha legible, no ponemos caducidad
+        caducidad_text = ""
+        if caducidad and str(caducidad).strip().lower() not in ("permanente", "null", "none", ""):
+            caducidad_text = f"\nCaducidad: {caducidad}\n"
+
+        subject = "Asunto: Tu licencia de SelectLive"
+        body = (
+            f"{subject}\n\n"
+            f"Hola {nombre},\n"
+            "Gracias por tu compra.\n\n"
+            "Aquí tienes tu clave de licencia de SelectLive:\n\n"
+            f"{clave}\n"
+            f"{caducidad_text}\n"
+            "Para activarla:\n"
+            "1. Abre SelectLive\n"
+            "2. Pulsa “Activar / cambiar licencia”\n"
+            "3. Introduce la clave y confirma\n"
+            "4. Reinicia el programa y listo\n\n"
+            "Si necesitas ayuda con la instalación o el cambio de equipo, responde a este mensaje y te ayudamos.\n\n"
+            "Un saludo,\n"
+            "Equipo de SelectLive"
+        )
+
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(body)
+            self.root.update()
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo copiar al portapapeles:\n{e}")
+            return
+
+        messagebox.showinfo("Copiado", "Texto del mail copiado al portapapeles.")
+
+    def _extend_selected_license(self):
+        if not self.admin_token:
+            messagebox.showerror("Error", "ADMIN_TOKEN no está configurado.")
+            return
+
+        values = self._get_selected_row()
+        if not values:
+            messagebox.showwarning(
+                "Selecciona una fila",
+                "Selecciona un cliente/licencia en la tabla para añadir tiempo.",
+            )
+            return
+
+        nombre, _telefono, _duracion, _caducidad, _restante, clave = values
+
+        opciones = ["3 días", "1 mes", "3 meses", "6 meses", "12 meses", "Permanente"]
+        duracion = simpledialog.askstring(
+            "Añadir tiempo",
+            "¿Cuánto tiempo quieres añadir?\n\n"
+            f"Cliente: {nombre}\n"
+            f"Clave: {clave}\n\n"
+            "Opciones: 3 días / 1 mes / 3 meses / 6 meses / 12 meses / Permanente",
+            parent=self.root,
+        )
+        if not duracion:
+            return
+
+        duracion = duracion.strip()
+        if duracion not in opciones:
+            messagebox.showerror(
+                "Duración no válida",
+                "Introduce exactamente una de estas opciones:\n"
+                "3 días, 1 mes, 3 meses, 6 meses, 12 meses, Permanente",
+            )
+            return
+
+        ok = messagebox.askyesno(
+            "Confirmar",
+            f"¿Añadir '{duracion}' a la licencia?\n\n{clave}",
+            parent=self.root,
+        )
+        if not ok:
+            return
+
+        try:
+            resp = requests.post(
+                f"{self.base_url}/admin/extend_license/{clave}",
+                json={"duration_label": duracion},
+                headers={"X-Admin-Token": self.admin_token},
+                timeout=10,
+            )
+        except Exception as e:
+            messagebox.showerror("Error de conexión", f"No se pudo contactar con el servidor:\n{e}")
+            return
+
+        if resp.status_code != 200:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                detail = resp.text
+            messagebox.showerror("Error", f"Código {resp.status_code}:\n{detail}")
+            return
+
+        self._refresh_clients()
+        messagebox.showinfo("Renovada", "Tiempo añadido correctamente.")
 
     def _delete_selected_license(self):
         if not self.admin_token:
@@ -343,9 +580,8 @@ class LicenseCreatorApp:
 
         data = resp.json()
 
-        # Limpiar tabla
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        # Cache + render (filtrable)
+        self._clients_cache = []
 
         for row in data:
             name = row.get("customer_name") or ""
@@ -365,12 +601,11 @@ class LicenseCreatorApp:
 
             restante = "CADUCADO" if is_expired else self._human_remaining(expires_at)
 
-            self.tree.insert(
-                "",
-                "end",
-                values=(name, phone, duration, caducidad, restante, license_key),
-                tags=("expired",) if is_expired else (),
-            )
+            values = (name, phone, duration, caducidad, restante, license_key)
+            tags = ("expired",) if is_expired else ()
+            self._clients_cache.append((values, tags))
+
+        self._apply_filter()
 
     def crear_licencia(self):
         # Validar ADMIN_TOKEN
