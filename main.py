@@ -22,6 +22,37 @@ async def get_conn():
     return await asyncpg.connect(DATABASE_URL)
 
 
+async def _ensure_admin_tables() -> None:
+    """
+    Crea (si no existen) las tablas auxiliares para el panel interno.
+
+    Nota: no tocamos el esquema principal de licencias para no romper /activate y /check.
+    """
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS issued_licenses (
+              id uuid PRIMARY KEY,
+              license_id uuid NOT NULL,
+              license_key text NOT NULL UNIQUE,
+              customer_name text NOT NULL DEFAULT '',
+              customer_phone text NOT NULL DEFAULT '',
+              duration_label text NOT NULL DEFAULT '',
+              expires_at timestamptz NULL,
+              created_at timestamptz NOT NULL DEFAULT now()
+            );
+            """
+        )
+    finally:
+        await conn.close()
+
+
+@app.on_event("startup")
+async def _startup():
+    await _ensure_admin_tables()
+
+
 class ActivateRequest(BaseModel):
     license_key: str
     machine_id: str
@@ -138,13 +169,21 @@ class CreateLicenseRequest(BaseModel):
     """
 
     max_devices: int = 1
+    # Compatibilidad: los primeros scripts usaban days_valid directamente.
     days_valid: int | None = 365
+    # Nuevos campos para panel interno
+    customer_name: str = ""
+    customer_phone: str = ""
+    duration_label: str = ""  # p.ej: "3 días", "1 mes", "Permanente"
 
 
 class CreateLicenseResponse(BaseModel):
     license_key: str
     expires_at: datetime | None
     max_devices: int
+    customer_name: str | None = None
+    customer_phone: str | None = None
+    duration_label: str | None = None
 
 
 @app.post("/admin/create_license", response_model=CreateLicenseResponse)
@@ -165,25 +204,57 @@ async def create_license(
     if not x_admin_token or x_admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="No autorizado")
 
+    # Resolver duración
+    duration_map = {
+        "3 días": 3,
+        "1 mes": 30,
+        "3 meses": 90,
+        "6 meses": 180,
+        "12 meses": 365,
+        "Permanente": None,
+        "": body.days_valid,  # compatibilidad
+    }
+
+    resolved_days = duration_map.get(body.duration_label, body.days_valid)
+
     expires_at: datetime | None = None
-    if body.days_valid is not None:
-        expires_at = datetime.now(timezone.utc) + timedelta(days=body.days_valid)
+    if resolved_days is not None:
+        expires_at = datetime.now(timezone.utc) + timedelta(days=int(resolved_days))
 
     license_id = uuid.uuid4()
     license_key = uuid.uuid4().hex[:16].upper()
 
     conn = await get_conn()
     try:
-        await conn.execute(
-            """
-            INSERT INTO licenses (id, license_key, status, max_devices, expires_at)
-            VALUES ($1, $2, 'active', $3, $4)
-            """,
-            license_id,
-            license_key,
-            body.max_devices,
-            expires_at,
-        )
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO licenses (id, license_key, status, max_devices, expires_at)
+                VALUES ($1, $2, 'active', $3, $4)
+                """,
+                license_id,
+                license_key,
+                body.max_devices,
+                expires_at,
+            )
+
+            await conn.execute(
+                """
+                INSERT INTO issued_licenses (
+                  id, license_id, license_key,
+                  customer_name, customer_phone, duration_label, expires_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (license_key) DO NOTHING
+                """,
+                uuid.uuid4(),
+                license_id,
+                license_key,
+                (body.customer_name or "").strip(),
+                (body.customer_phone or "").strip(),
+                (body.duration_label or "").strip(),
+                expires_at,
+            )
     finally:
         await conn.close()
 
@@ -191,4 +262,53 @@ async def create_license(
         license_key=license_key,
         expires_at=expires_at,
         max_devices=body.max_devices,
+        customer_name=(body.customer_name or "").strip() or None,
+        customer_phone=(body.customer_phone or "").strip() or None,
+        duration_label=(body.duration_label or "").strip() or None,
     )
+
+
+class ClientRow(BaseModel):
+    customer_name: str
+    customer_phone: str
+    duration_label: str
+    license_key: str
+    expires_at: datetime | None
+    created_at: datetime
+
+
+@app.get("/admin/clients", response_model=list[ClientRow])
+async def list_clients(
+    x_admin_token: str = Header(None, alias="X-Admin-Token"),
+):
+    if not ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="ADMIN_TOKEN no está configurado en el servidor",
+        )
+
+    if not x_admin_token or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="No autorizado")
+
+    conn = await get_conn()
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT customer_name, customer_phone, duration_label, license_key, expires_at, created_at
+            FROM issued_licenses
+            ORDER BY created_at DESC
+            """
+        )
+        return [
+            ClientRow(
+                customer_name=r["customer_name"] or "",
+                customer_phone=r["customer_phone"] or "",
+                duration_label=r["duration_label"] or "",
+                license_key=r["license_key"],
+                expires_at=r["expires_at"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+    finally:
+        await conn.close()
